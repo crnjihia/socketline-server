@@ -1,0 +1,90 @@
+name: CI
+on:
+  push:
+    branches: [ main, scaffold ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        compiler: [gcc-14, clang-18]
+        build_type: [release, debug]
+        sanitizer: [none, asan, tsan]
+        exclude:
+          - build_type: release
+            sanitizer: asan
+          - build_type: release
+            sanitizer: tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build liburing-dev libssl-dev valgrind \
+            gcc-14 g++-14 clang-18
+
+      - name: Configure ASLR entropy for ThreadSanitizer
+        if: matrix.sanitizer == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Select Compiler and Preset
+        id: setup
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc-14" ]; then
+            echo "cxx=g++-14" >> $GITHUB_OUTPUT
+            echo "cc=gcc-14" >> $GITHUB_OUTPUT
+          else
+            echo "cxx=clang++-18" >> $GITHUB_OUTPUT
+            echo "cc=clang-18" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "${{ matrix.sanitizer }}" = "asan" ]; then
+            echo "preset=asan" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.sanitizer }}" = "tsan" ]; then
+            echo "preset=tsan" >> $GITHUB_OUTPUT
+          else
+            echo "preset=${{ matrix.build_type }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure
+        run: |
+          cmake --preset ${{ steps.setup.outputs.preset }} \
+            -DCMAKE_CXX_COMPILER=${{ steps.setup.outputs.cxx }} \
+            -DCMAKE_C_COMPILER=${{ steps.setup.outputs.cc }}
+
+      - name: Build
+        run: cmake --build --preset ${{ steps.setup.outputs.preset }} -j $(nproc)
+
+      - name: Unit Tests
+        run: ctest --preset ${{ steps.setup.outputs.preset }} --output-on-failure
+
+      - name: Integration Test
+        run: |
+          chmod +x tests/integration_test.sh
+          ./tests/integration_test.sh ./build/${{ steps.setup.outputs.preset }}/socketline_server
+
+  valgrind-clean-run:
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build liburing-dev libssl-dev valgrind g++-14 gcc-14
+
+      - name: Configure & Build Release
+        run: |
+          cmake --preset release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14
+          cmake --build --preset release -j $(nproc)
+
+      - name: Valgrind Memcheck
+        run: valgrind --tool=memcheck --leak-check=full --error-exitcode=1 ./build/release/socketline_tests
+
+      - name: Valgrind Helgrind
+        run: valgrind --tool=helgrind --error-exitcode=1 ./build/release/socketline_tests
