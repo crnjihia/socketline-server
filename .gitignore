@@ -1,0 +1,23 @@
+# Compiled object files and build artefacts
+build/
+# Object files
+*.o
+*.obj
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeOutputs.txt
+CMakeTmp/
+# Compiled binaries
+*.exe
+*.out
+*.a
+*.so
+*.dylib
+# Logs
+*.log
+# Misc
+*.swp
+*.swo
+*.tmp
