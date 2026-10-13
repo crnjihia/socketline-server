@@ -1,0 +1,30 @@
+[Unit]
+Description=Socketline Server (C++20 High-Throughput HTTP & WebSocket Relay)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/socketline_server 8080
+Restart=on-failure
+RestartSec=2s
+User=socketline
+Group=socketline
+
+# Concurrency & file descriptor tuning
+LimitNOFILE=65536
+LimitNPROC=32768
+
+# Graceful Drain on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+SendSIGKILL=yes
+
+# Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
