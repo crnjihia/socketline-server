@@ -1,14 +1,120 @@
 # Socketline Server
 
 [![CI](https://github.com/crnjihia/socketline-server/actions/workflows/ci.yml/badge.svg)](https://github.com/crnjihia/socketline-server/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/crnjihia/socketline-server?color=blue&logo=github)](https://github.com/crnjihia/socketline-server/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![C++20](https://img.shields.io/badge/standard-C%2B%2B20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![C++20](https://img.shields.io/badge/Standard-C%2B%2B20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![Sanitizers: ASan+UBSan+TSan](https://img.shields.io/badge/Sanitizers-Clean-brightgreen.svg)]()
+[![Valgrind: Clean](https://img.shields.io/badge/Valgrind-Clean%20(0%20leaks)-brightgreen.svg)]()
 
-High-throughput HTTP/1.1 and RFC 6455 WebSocket relay server engineered from raw POSIX sockets in modern C++20. Socketline serves as the real-time notification fan-out backbone for Safaricom Daraja M-Pesa callbacks, delivering zero-copy static asset streaming, non-blocking edge-triggered concurrency, and sub-millisecond event dispatching.
+High-throughput, asynchronous HTTP/1.1 and RFC 6455 WebSocket server engineered from raw POSIX sockets in modern C++20 — built with zero external runtime frameworks (no Boost.Asio, no libuv). 
+
+Socketline serves as the mission-critical real-time notification relay for **Safaricom Daraja M-Pesa** callbacks, verifying cryptographic signatures, caching transaction history in circular ring buffers, and streaming instantaneous payment confirmations to subscribed point-of-sale and mobile clients.
+
+---
+
+## Live Monitoring Dashboard
+
+![Socketline Server Dashboard](docs/assets/dashboard.png)
+
+*Socketline Server live dashboard serving static assets via zero-copy `sendfile(2)`, maintaining persistent RFC 6455 WebSockets, verifying incoming Daraja HMAC-SHA256 callback notifications, and displaying real-time payment events.*
+
+---
+
+## Architectural Highlights
+
+- **Event Loop Core**: Linux `epoll` in edge-triggered mode (`EPOLLET`). Every file descriptor is set non-blocking (`O_NONBLOCK`). I/O loops systematically handle `EAGAIN` / `EWOULDBLOCK` without busy-waiting.
+- **io_uring Backend**: Compile-time toggle (`-DSOCKETLINE_USE_IO_URING=ON`) that offloads connection accept, read, and write operations to kernel submission queue entries, with automatic fallback when `IORING_SETUP_SQPOLL` is unavailable.
+- **Lock-Free Concurrency**: Dedicated per-core worker threads driven by lock-free Chase-Lev work-stealing deques using atomic `std::memory_order_seq_cst` synchronization (verified clean under ThreadSanitizer).
+- **Zero-Copy HTTP/1.1 Parser**: Request methods, paths, and headers are parsed into `std::string_view` slices pointing directly into socket receive buffers with zero dynamic heap allocations on the hot path. Full support for `Expect: 100-continue` and chunked transfer decoding.
+- **RFC 6455 WebSocket Engine**: Full handshake implementation computing `Sec-WebSocket-Accept` via SHA-1 + Base64 with standard GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`. Frame parser unmasks client payloads, supports 16-bit/64-bit extended payload lengths, handles Ping/Pong and Close control codes, and reassembles fragmented messages.
+- **sendfile(2) Zero-Copy Streaming**: Directly streams static assets under `public/` from disk to client socket descriptors in kernel space, completely avoiding user-space memory copies.
+- **Graceful Shutdown**: Traps `SIGTERM` / `SIGINT`, closes the listening socket, drains in-flight client requests over a configurable timeout (5s), and exits cleanly with return code 0.
+- **Daraja M-Pesa Relay Backbone**: `POST /callback` verifies Safaricom HMAC-SHA256 signatures, fans out payload notifications to all WebSockets subscribed to the merchant's `BusinessShortCode`, and preserves the last 1,000 transactions in an in-memory ring buffer for reconnect replay.
+
+---
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    subgraph Client Tier
+        Browser[WebSocket Client / POSIX Client]
+        Safaricom[Safaricom Daraja Gateway]
+    end
+
+    subgraph Kernel Space
+        EP[Linux epoll EPOLLET / io_uring]
+        SF[sendfile 2 Engine]
+    end
+
+    subgraph Socketline Server Core
+        Acceptor[Acceptor Loop & EventLoop]
+        Router{Router & Parser}
+        HP[Zero-Copy HTTP Parser string_view]
+        WS[RFC 6455 WebSocket Engine]
+        
+        subgraph Concurrency Tier
+            TP[Lock-Free Thread Pool]
+            CL1[Worker 1 Chase-Lev Deque]
+            CL2[Worker N Chase-Lev Deque]
+        end
+
+        subgraph Daraja Relay Tier
+            HMAC[HMAC-SHA256 Validator]
+            RB[(Per-Merchant Ring Buffer 1000 Events)]
+            SM[Merchant Subscription Manager]
+        end
+    end
+
+    Browser <-->|TCP Sockets / HTTP / WS| EP
+    Safaricom -->|POST /callback| EP
+    EP --> Acceptor
+    Acceptor --> Router
+    Router -->|GET /static| SF
+    Router -->|HTTP Upgrade / WS Frame| WS
+    Router -->|POST /callback| HMAC
+    HMAC -->|Signature Verified| RB
+    HMAC -->|Fan-Out Broadcast| SM
+    SM -->|Push Notification| WS
+    WS <--> TP
+    TP <--> CL1
+    TP <--> CL2
+```
+
+### Daraja Callback & Fan-Out Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor POS as Merchant POS / Client
+    participant Server as Socketline Server
+    participant Gateway as Safaricom M-Pesa
+
+    POS->>Server: GET / (Upgrade: websocket)
+    Server-->>POS: HTTP/1.1 101 Switching Protocols (RFC 6455)
+    POS->>Server: WS Frame: SUBSCRIBE:174379
+    Server-->>POS: WS Frame: SUBSCRIBED:174379
+    
+    Note over Gateway,Server: Customer pays via STK Push
+    Gateway->>Server: POST /callback (X-Hub-Signature: sha256=...)
+    Note over Server: Verify HMAC-SHA256 with merchant secret
+    Server->>Server: Push into 1000-event circular ring buffer
+    Server-->>Gateway: HTTP/1.1 200 OK {"status":"relayed"}
+    
+    Server->>POS: WS Frame: {"BusinessShortCode":"174379", "TransAmount":"3500.00", ...}
+    
+    opt Reconnect Replay
+        POS->>Server: WS Frame: REPLAY:174379
+        Server-->>POS: Stream buffered historical transactions (FIFO)
+    end
+```
 
 ---
 
 ## Hardware Specification
+
+All benchmarks and profiling data recorded on the following reference host:
 
 - **CPU**: AMD Ryzen 7 5800H (8 Cores, 16 Threads @ 3.20 GHz base / 4.40 GHz boost)
 - **RAM**: 32 GB DDR4-3200 MT/s
@@ -17,16 +123,51 @@ High-throughput HTTP/1.1 and RFC 6455 WebSocket relay server engineered from raw
 
 ---
 
-## Architectural Highlights
+## 60-Second Quickstart
 
-- **Event Loop**: Linux `epoll` in edge-triggered mode (`EPOLLET`). Every file descriptor is set non-blocking (`O_NONBLOCK`). All I/O operations rigorously check `EAGAIN` / `EWOULDBLOCK` without spin-looping.
-- **io_uring Backend**: Compile-time switch (`-DSOCKETLINE_USE_IO_URING=ON`) offloading connection accept, read, and write submission queue entries directly to kernel rings with automatic `IORING_SETUP_SQPOLL` fallback.
-- **Lock-Free Thread Pool**: Dedicated core workers driven by a lock-free Chase-Lev work-stealing deque with atomic `std::memory_order_seq_cst` synchronization.
-- **Zero-Copy HTTP/1.1 Parser**: Request line, methods, and headers are parsed into `std::string_view` slices referencing socket receive buffers with zero dynamic heap allocations on the hot path. Full support for `Expect: 100-continue` and chunked transfer encoding.
-- **RFC 6455 WebSocket Engine**: Compliant handshake computing `Sec-WebSocket-Accept` via SHA-1 and Base64 (`258EAFA5-E914-47DA-95CA-C5AB0DC85B11`). High-performance frame parsing with payload unmasking, fragmentation reassembly, and control frame handling (Ping/Pong/Close).
-- **sendfile(2) Zero-Copy Streaming**: Kernel-space direct file-to-socket descriptor streaming via `sendfile(2)` for assets under `public/`, eliminating user-space memory copies.
-- **Graceful Shutdown**: Intercepts `SIGTERM` / `SIGINT`, unregisters listeners, and drains in-flight client pipelines within a configurable 5-second window.
-- **Daraja M-Pesa Relay Backbone**: `POST /callback` verifies cryptographic Safaricom HMAC-SHA256 signatures, fans out notifications to all WebSockets subscribed to the merchant's `BusinessShortCode`, and preserves the last 1,000 events in an in-memory circular ring buffer for reconnect replay.
+### 1. Build from Clean Checkout
+
+```bash
+# Configure and build Release preset in a single command
+cmake --preset release && cmake --build --preset release
+```
+
+### 2. Run the Server
+
+```bash
+./build/release/socketline_server 8080
+```
+
+### 3. Open the Dashboard & Simulate a Daraja Payment
+
+1. Open your browser to `http://localhost:8080/`. The WebSocket connection indicator will display **Connected**.
+2. In a separate terminal, trigger an M-Pesa payment callback:
+
+**Using PowerShell:**
+```powershell
+$body = '{"BusinessShortCode":"174379","TransAmount":"3500.00","BillRefNumber":"INV-8021","MSISDN":"254712345678"}'
+$secret = "daraja_secret_passkey"
+$hmac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($secret))
+$hash = [BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($body))).Replace("-","").ToLower()
+
+Invoke-RestMethod -Uri "http://localhost:8080/callback" -Method Post -Headers @{
+    "Content-Type" = "application/json"
+    "X-Hub-Signature" = "sha256=$hash"
+} -Body $body
+```
+
+**Using Bash / cURL:**
+```bash
+PAYLOAD='{"BusinessShortCode":"174379","TransAmount":"3500.00","BillRefNumber":"INV-8021","MSISDN":"254712345678"}'
+HMAC=$(printf "%s" "$PAYLOAD" | openssl dgst -sha256 -hmac "daraja_secret_passkey" | awk '{print $NF}')
+
+curl -i -X POST http://localhost:8080/callback \
+  -H "Content-Type: application/json" \
+  -H "X-Hub-Signature: sha256=${HMAC}" \
+  -d "$PAYLOAD"
+```
+
+The browser feed will update instantly with the newly broadcast transaction!
 
 ---
 
@@ -38,7 +179,7 @@ Measurements conducted with connection concurrency profiles simulating burst cal
 wrk -t12 -c400 -d30s --latency http://localhost:8080/
 ```
 
-### Throughput & Latency Comparison
+### Throughput & Latency Comparison Table
 
 | Concurrency Profile | Metric | Socketline (epoll ET) | Socketline (io_uring) | Nginx 1.24 | Node.js 20 (Cluster) |
 |---|---|---|---|---|---|
@@ -52,11 +193,14 @@ wrk -t12 -c400 -d30s --latency http://localhost:8080/
 | | P50 Latency | **1.74 ms** | **1.42 ms** | 3.65 ms | 8.90 ms |
 | | P99 Latency | **12.40 ms** | **9.80 ms** | 26.50 ms | 59.40 ms |
 
-Raw benchmark run outputs are committed in [`benchmarks/results/`](file:///c:/Users/crnji/Videos/Projects/C++/socketline-server/benchmarks/results/).
+Raw benchmark run outputs are committed in [`benchmarks/results/`](benchmarks/results/):
+- [`socketline.txt`](benchmarks/results/socketline.txt)
+- [`nginx.txt`](benchmarks/results/nginx.txt)
+- [`node.txt`](benchmarks/results/node.txt)
 
 ---
 
-## Profiling & Performance Diagnostics
+## Profiling & Hardware Diagnostics
 
 ### Hardware Counters (`perf stat`)
 
@@ -77,7 +221,7 @@ Raw benchmark run outputs are committed in [`benchmarks/results/`](file:///c:/Us
 
 ### System Call Trace (`strace -c -f`) Proving `sendfile(2)` Zero-Copy
 
-Empirical verification that static content is transferred via kernel zero-copy `sendfile(2)` rather than `read()` / `write()` loops:
+Full empirical verification that static content is transferred via kernel zero-copy `sendfile(2)` rather than user-space `read()` / `write()` loops:
 
 ```text
 % time     seconds  usecs/call     calls    errors syscall
@@ -123,7 +267,7 @@ Empirical verification that static content is transferred via kernel zero-copy `
 
 ---
 
-## Valgrind Verification
+## Valgrind Verification Logs
 
 ### Memcheck (Zero Memory Leaks)
 
@@ -151,12 +295,12 @@ Empirical verification that static content is transferred via kernel zero-copy `
 
 | Dimension | Linux `epoll` (`EPOLLET`) | Linux `io_uring` (`IORING_SETUP_SQPOLL`) |
 |---|---|---|
-| **Kernel Requirement** | Linux 2.6+ (Ubiquitous across older enterprise distros) | Linux 5.1+ (5.10+ recommended for stable network I/O) |
-| **System Call Overhead** | Requires `epoll_wait`, `read`, `write`, `accept4` transitions | Zero system calls in steady state with kernel polling thread |
-| **Buffer Management** | User allocates buffer upon `EPOLLIN` notification | Fixed buffers registered in kernel space (`io_uring_register_buffers`) |
-| **Latency Under Load** | Context switch penalty on high interrupt frequency | Lowest tail latency under sustained saturation |
+| **Kernel Requirement** | Linux 2.6+ (Broad compatibility) | Linux 5.1+ (5.10+ recommended for networking) |
+| **System Call Overhead** | Context switch on `epoll_wait`, `read`, `write`, `accept4` | True zero-syscall steady state with kernel polling thread |
+| **Buffer Management** | Buffer allocated per client in user space upon `EPOLLIN` | Kernel-registered fixed buffers (`io_uring_register_buffers`) |
+| **Latency Under Load** | Interrupt frequency penalties under high connection rates | Lowest tail latency under sustained network saturation |
 | **CPU Utilization** | Lower idle CPU usage | SQPOLL kernel thread consumes a dedicated core continuously |
-| **Failure Modes** | Standard POSIX error codes (`EAGAIN`, `EINTR`) | Asynchronous completions in CQE require rigorous lifecycle tracking |
+| **Failure Modes** | Standard synchronous POSIX error codes (`EAGAIN`, `EINTR`) | Asynchronous completions in CQE require strict lifecycle tracking |
 
 ---
 
@@ -189,22 +333,15 @@ Empirical verification that static content is transferred via kernel zero-copy `
 
 ---
 
-## Build & Test Instructions
+## Test Suite & Sanitizer Presets
 
-### Single Command Build (Release Preset)
-
-```bash
-# Configure and build in a single pass
-cmake --preset release && cmake --build --preset release
-```
-
-### Run Unit Tests
+### Run GoogleTest Suite
 
 ```bash
 ctest --preset release --output-on-failure
 ```
 
-### Run Integration Test
+### Run End-to-End Integration Suite
 
 ```bash
 chmod +x tests/integration_test.sh
@@ -225,14 +362,20 @@ cmake --preset tsan && cmake --build --preset tsan
 
 ---
 
-## Deployment
+## Deployment Configuration
 
-Production systemd unit file and high-concurrency Nginx reverse-proxy configurations are located in [`deploy/`](file:///c:/Users/crnji/Videos/Projects/C++/socketline-server/deploy/):
-- `deploy/socketline.service`: Configured with `KillSignal=SIGTERM`, `TimeoutStopSec=30`, `LimitNOFILE=65536`.
-- `deploy/nginx.conf`: Tuned for WebSocket connection upgrades and edge static caching.
+Production systemd unit file and high-concurrency Nginx reverse-proxy configurations are located in [`deploy/`](deploy/):
+- [`deploy/socketline.service`](deploy/socketline.service): Configured with `KillSignal=SIGTERM`, `TimeoutStopSec=30`, `LimitNOFILE=65536`.
+- [`deploy/nginx.conf`](deploy/nginx.conf): Tuned for WebSocket connection upgrades and edge static caching.
+
+---
+
+## Contributing
+
+Please see [`CONTRIBUTING.md`](CONTRIBUTING.md) for branch management, commit style, and PR guidelines.
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [`LICENSE`](LICENSE) for details.
